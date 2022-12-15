@@ -1393,6 +1393,7 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
     # TODO: qualifier both in function_name as ARN and in qualifier?
     # TODO: test for qualifier being a number (i.e. version)
     # TODO: test for conflicts between function_name as ARN and provided qualifier
+    # See get_permissions for qualifier handling
     def create_function_url_config(
         self,
         context: RequestContext,
@@ -1619,37 +1620,41 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
         function_name, qualifier = api_utils.get_name_and_qualifier(
             request.get("FunctionName"), request.get("Qualifier"), context.region
         )
-        resolved_fn = state.functions.get(function_name)
 
+        if qualifier is None:
+            qualifier = "$LATEST"
+        else:
+            if not api_utils.is_qualifier_expression(qualifier):
+                raise ValidationException(
+                    f"1 validation error detected: Value '{qualifier}' at 'qualifier' failed to satisfy constraint: "
+                    f"Member must satisfy regular expression pattern: (|[a-zA-Z0-9$_-]+)"
+                )
+            if qualifier == "$LATEST":
+                raise InvalidParameterValueException(
+                    "We currently do not support adding policies for $LATEST.", Type="User"
+                )
+
+        resolved_fn = state.functions.get(function_name)
         if not resolved_fn:
             fn_arn = api_utils.unqualified_lambda_arn(
                 function_name, context.account_id, context.region
             )
             raise ResourceNotFoundException(f"Function not found: {fn_arn}", Type="User")
 
-        resolved_qualifier = request.get("Qualifier", "$LATEST")
-
-        resource = api_utils.unqualified_lambda_arn(
-            function_name, context.account_id, context.region
+        resource = api_utils.qualified_lambda_arn(
+            function_name, qualifier, context.account_id, context.region
         )
-        if api_utils.qualifier_is_alias(resolved_qualifier):
-            if resolved_qualifier not in resolved_fn.aliases:
-                raise ResourceNotFoundException("Where Alias???", Type="User")  # TODO: test
-            resource = api_utils.qualified_lambda_arn(
-                function_name, resolved_qualifier, context.account_id, context.region
-            )
-        elif api_utils.qualifier_is_version(resolved_qualifier):
-            if resolved_qualifier not in resolved_fn.versions:
-                raise ResourceNotFoundException("Where Version???", Type="User")  # TODO: test
-            resource = api_utils.qualified_lambda_arn(
-                function_name, resolved_qualifier, context.account_id, context.region
-            )
-        elif resolved_qualifier != "$LATEST":
-            raise ResourceNotFoundException("Wrong format for qualifier?")
-        # TODO: is there a different int he resulting policy when adding $LATEST manually?
+        if api_utils.qualifier_is_alias(qualifier):
+            if qualifier not in resolved_fn.aliases:
+                raise ResourceNotFoundException(f"Cannot find alias arn: {resource}", Type="User")
+        elif api_utils.qualifier_is_version(qualifier):
+            if qualifier not in resolved_fn.versions:
+                raise ResourceNotFoundException(f"Function not found: {resource}", Type="User")
+        else:
+            raise ResourceNotFoundException(f"Function not found: {resource}", Type="User")
 
         # check for an already existing policy and any conflicts in existing statements
-        existing_policy = resolved_fn.permissions.get(resolved_qualifier)
+        existing_policy = resolved_fn.permissions.get(qualifier)
         if existing_policy:
             if request["StatementId"] in [s["Sid"] for s in existing_policy.policy.Statement]:
                 # TODO: is this unique just in the policy or across all policies in region/account/function (?)
@@ -1670,7 +1675,7 @@ class LambdaProvider(LambdaApi, ServiceLifecycleHook):
             )
         policy.policy.Statement.append(permission_statement)
         if not existing_policy:
-            resolved_fn.permissions[resolved_qualifier] = policy
+            resolved_fn.permissions[qualifier] = policy
         return AddPermissionResponse(Statement=json.dumps(permission_statement))
 
     def remove_permission(
